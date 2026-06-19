@@ -403,6 +403,11 @@ class GroqClient:
                                model_attempts, model, exc)
             except Exception as exc:
                 err_str = str(exc)
+                
+                # If image is corrupted or too large, do not retry, just fail to fallback
+                if ("400" in err_str and ("invalid image data" in err_str.lower() or "image too large" in err_str.lower())) or ("413" in err_str) or ("too large" in err_str.lower()):
+                    logger.error("Invalid/Too Large image data detected! Aborting retries for this claim.")
+                    raise RuntimeError("Corrupted or Oversized image data")
                 # If quota exhausted for this model, mark it and try next instantly
                 if "429" in err_str or "rate limit" in err_str.lower():
                     logger.warning("Model %s quota exhausted on key %d, adding to fallback list", model, self.current_key_idx)
