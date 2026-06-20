@@ -22,8 +22,10 @@ import argparse
 import logging
 import traceback
 import base64
+import io
 from pathlib import Path
 from typing import Optional
+from PIL import Image
 from groq import Groq
 
 # ---------------------------------------------------------------------------
@@ -46,8 +48,8 @@ API_KEY_ENV = os.environ.get("GROQ_API_KEYS", os.environ.get("GROQ_API_KEY", "")
 API_KEYS = [k.strip() for k in API_KEY_ENV.split(",") if k.strip()]
 
 MAX_RETRIES = 5
-RETRY_BASE_DELAY = 4          # seconds, doubles each retry
-RATE_LIMIT_DELAY = 2.0        # seconds between requests (safe for 60 RPM free tier)
+RETRY_BASE_DELAY = 10            # seconds, doubles each retry
+RATE_LIMIT_DELAY = 15.0          # per-key cooldown; with 2 keys effective gap is ~7.5s
 TEMPERATURE = 0.1             # low for determinism
 
 # Paths – resolved relative to *this* file so it works from any cwd
@@ -124,8 +126,52 @@ def relevant_requirements(claim_object: str, all_reqs: list[dict]) -> list[dict]
     return [r for r in all_reqs if r["claim_object"] in ("all", claim_object)]
 
 
+# Groq limit: 33,177,600 pixels. Use 30M as safe threshold.
+MAX_PIXELS = 30_000_000
+MAX_FILE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+
+def _resize_image(data: bytes, mime: str) -> tuple[bytes, str]:
+    """Resize/re-encode image if it exceeds limits or is an unsupported format."""
+    img = Image.open(io.BytesIO(data))
+    w, h = img.size
+    pixels = w * h
+
+    needs_reencode = img.format not in ('JPEG', 'PNG')
+    needs_resize = pixels > MAX_PIXELS or len(data) > MAX_FILE_BYTES
+    
+    if not needs_resize and not needs_reencode:
+        return data, mime
+
+    scale = min(1.0, (MAX_PIXELS / pixels) ** 0.5) if pixels > 0 else 1.0
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    
+    if needs_resize:
+        logger.info("  Resizing image %dx%d (%.1fM px) -> %dx%d (%.1fM px)",
+                    w, h, pixels / 1e6, new_w, new_h, new_w * new_h / 1e6)
+    elif needs_reencode:
+        logger.info("  Re-encoding image from %s to JPEG", img.format)
+
+    img = img.convert("RGB")  # ensure no alpha for JPEG
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    resized_data = buf.getvalue()
+
+    # If still too large, reduce quality further
+    if len(resized_data) > MAX_FILE_BYTES:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=60)
+        resized_data = buf.getvalue()
+        logger.info("  Further compressed to quality=60 (%d bytes)", len(resized_data))
+
+    return resized_data, "image/jpeg"
+
+
 def load_image_bytes(image_relpath: str) -> tuple[bytes, str]:
-    """Load image from dataset-relative path; return (bytes, mime)."""
+    """Load image from dataset-relative path; return (bytes, mime). Auto-resizes if too large."""
     full = DATASET_DIR / image_relpath
     if not full.exists():
         raise FileNotFoundError(f"Image not found: {full}")
@@ -134,7 +180,7 @@ def load_image_bytes(image_relpath: str) -> tuple[bytes, str]:
         ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
         ".png": "image/png",  ".webp": "image/webp",
     }.get(full.suffix.lower(), "image/jpeg")
-    return data, mime
+    return _resize_image(data, mime)
 
 
 def image_id(path: str) -> str:
@@ -300,61 +346,51 @@ RESPONSE FORMAT — return ONLY this JSON
 
 MODEL_FALLBACK_CHAIN = [
     "meta-llama/llama-4-scout-17b-16e-instruct",
-    "meta-llama/llama-4-maverick",
 ]
 
 
 class GroqClient:
-    """Thin wrapper with retries, model fallback, key rotation, rate-limit delay, and token tracking."""
+    """Thin wrapper with proactive key rotation, smart delays, retries, and token tracking."""
 
     def __init__(self, api_keys: list[str], model_name: str):
         self.api_keys = api_keys
+        self.num_keys = len(api_keys)
         self.current_key_idx = 0
         self.model_name = model_name
-        self._last_ts = 0.0
+        # Per-key last request timestamps for independent cooldowns
+        self._key_last_ts: dict[int, float] = {i: 0.0 for i in range(self.num_keys)}
         # stats
         self.total_requests = 0
         self.total_input_tokens = 0
         self.total_output_tokens = 0
-        # exhausted models (per key)
-        self._exhausted_models: set[str] = set()
 
-        self._configure_client()
-
-    def _configure_client(self):
-        key = self.api_keys[self.current_key_idx]
-        self._client = Groq(api_key=key)
-        logger.info("  [key-rotate] Using API key index: %d", self.current_key_idx)
+        # Create a client per key to avoid re-creating on rotation
+        self._clients = [Groq(api_key=k) for k in api_keys]
+        logger.info("  Initialized %d API key(s) for round-robin rotation", self.num_keys)
 
     # ----- internal -----
 
-    def _wait(self):
-        gap = time.time() - self._last_ts
-        if gap < RATE_LIMIT_DELAY:
-            time.sleep(RATE_LIMIT_DELAY - gap)
-        self._last_ts = time.time()
+    def _pick_next_key(self) -> int:
+        """Pick the key with the oldest last-use timestamp (most rested)."""
+        best_idx = 0
+        best_ts = self._key_last_ts[0]
+        for i in range(1, self.num_keys):
+            if self._key_last_ts[i] < best_ts:
+                best_ts = self._key_last_ts[i]
+                best_idx = i
+        return best_idx
 
-    def _pick_model(self) -> str:
-        """Return current model, or fallback if it's exhausted."""
-        if self.model_name not in self._exhausted_models:
-            return self.model_name
-        for m in MODEL_FALLBACK_CHAIN:
-            if m not in self._exhausted_models:
-                logger.info("  [fallback] switching to model: %s", m)
-                return m
-        
-        # All models exhausted for this key. Try to rotate key.
-        if self.current_key_idx + 1 < len(self.api_keys):
-            self.current_key_idx += 1
-            self._exhausted_models.clear()
-            self._configure_client()
-            return self.model_name
-        
-        # All models and keys exhausted – try primary anyway
-        return self.model_name
+    def _wait_for_key(self, key_idx: int):
+        """Wait until per-key cooldown has elapsed."""
+        gap = time.time() - self._key_last_ts[key_idx]
+        if gap < RATE_LIMIT_DELAY:
+            wait = RATE_LIMIT_DELAY - gap
+            logger.debug("  [key %d] cooling down %.1fs", key_idx, wait)
+            time.sleep(wait)
+        self._key_last_ts[key_idx] = time.time()
 
     def analyze(self, prompt: str, images: list[tuple[bytes, str]]) -> dict:
-        """Send images + prompt -> parsed JSON dict (with retries + model fallback)."""
+        """Send images + prompt -> parsed JSON dict (with retries + key rotation)."""
         content = [{"type": "text", "text": prompt}]
         for img_bytes, mime in images:
             b64 = base64.b64encode(img_bytes).decode('utf-8')
@@ -367,16 +403,17 @@ class GroqClient:
             
         messages = [{"role": "user", "content": content}]
 
-        total_attempts = 0
-        model_attempts = 0
+        for attempt in range(1, MAX_RETRIES + 1):
+            # Pick the most-rested key
+            key_idx = self._pick_next_key()
+            client = self._clients[key_idx]
 
-        while total_attempts < 20:
-            total_attempts += 1
-            model = self._pick_model()
             try:
-                self._wait()
-                resp = self._client.chat.completions.create(
-                    model=model,
+                self._wait_for_key(key_idx)
+                logger.debug("  [attempt %d] using key %d", attempt, key_idx)
+
+                resp = client.chat.completions.create(
+                    model=self.model_name,
                     messages=messages,
                     response_format={"type": "json_object"},
                     temperature=TEMPERATURE,
@@ -398,39 +435,35 @@ class GroqClient:
                 return json.loads(text)
 
             except json.JSONDecodeError as exc:
-                model_attempts += 1
-                logger.warning("Attempt %d [%s] - JSON parse error: %s",
-                               model_attempts, model, exc)
+                logger.warning("Attempt %d [key %d] - JSON parse error: %s",
+                               attempt, key_idx, exc)
             except Exception as exc:
                 err_str = str(exc)
                 
-                # If image is corrupted or too large, do not retry, just fail to fallback
+                # If image is corrupted or too large, do not retry
                 if ("400" in err_str and ("invalid image data" in err_str.lower() or "image too large" in err_str.lower())) or ("413" in err_str) or ("too large" in err_str.lower()):
                     logger.error("Invalid/Too Large image data detected! Aborting retries for this claim.")
                     raise RuntimeError("Corrupted or Oversized image data")
-                # If quota exhausted for this model, mark it and try next instantly
-                if "429" in err_str or "rate limit" in err_str.lower():
-                    logger.warning("Model %s quota exhausted on key %d, adding to fallback list", model, self.current_key_idx)
-                    self._exhausted_models.add(model)
-                    model_attempts = 0
-                    continue
-                
-                model_attempts += 1
-                logger.warning("Attempt %d [%s] - API error: %s",
-                               model_attempts, model, exc)
-                
-                if model_attempts >= MAX_RETRIES:
-                    logger.warning("Model %s failed %d times consecutively. Exhausting it to force rotation.", model, model_attempts)
-                    self._exhausted_models.add(model)
-                    model_attempts = 0
-                    continue
 
-            # If we get here, it was a normal error (e.g. 503) and we haven't reached MAX_RETRIES yet.
-            delay = RETRY_BASE_DELAY * (2 ** (model_attempts - 1))
+                # Rate limit: wait longer and retry with a different key
+                if "429" in err_str or "rate limit" in err_str.lower():
+                    wait_time = RATE_LIMIT_DELAY * 2  # double the normal delay
+                    logger.warning("Rate limited on key %d, waiting %ds (attempt %d/%d)",
+                                   key_idx, wait_time, attempt, MAX_RETRIES)
+                    # Push this key's timestamp far into the future so other keys get picked
+                    self._key_last_ts[key_idx] = time.time() + wait_time
+                    time.sleep(wait_time)
+                    continue
+                
+                logger.warning("Attempt %d [key %d] - API error: %s",
+                               attempt, key_idx, exc)
+
+            # Backoff delay for non-rate-limit errors
+            delay = RETRY_BASE_DELAY * (2 ** min(attempt - 1, 3))
             logger.info("  retrying in %ds ...", delay)
             time.sleep(delay)
 
-        raise RuntimeError("All total retries and fallbacks exhausted for API call")
+        raise RuntimeError("All retries exhausted for API call")
 
     @property
     def stats(self) -> dict:
