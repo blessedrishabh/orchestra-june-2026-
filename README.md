@@ -1,161 +1,119 @@
-# HackerRank Orchestrate
+# Multi-Modal Evidence Review System
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon.
+A robust damage-claim verification pipeline powered by **Groq Llama 4 Scout** (free tier).
 
-Build a system that verifies visual evidence for damage claims across three object types: **cars**, **laptops**, and **packages**.
+## What it does
 
-Your system will receive claim conversations, one or more submitted images, user claim history, and minimum evidence requirements. It must decide whether the submitted images support the claim, contradict it, or do not provide enough information.
+For each damage claim, the system:
 
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, and allowed values.
+1. **Parses** the user's chat conversation to extract what they're claiming (damage type, object part)
+2. **Inspects** submitted images using Groq Llama 4 vision capabilities
+3. **Checks** evidence sufficiency against the evidence-requirements checklist
+4. **Evaluates** user history for risk context
+5. **Decides** whether the claim is `supported`, `contradicted`, or `not_enough_information`
+6. **Outputs** a structured row with justification, risk flags, severity, and supporting image IDs
 
----
+## Quick start
 
-## Contents
-
-1. [Repository layout](#repository-layout)
-2. [What you need to build](#what-you-need-to-build)
-3. [Where your code goes](#where-your-code-goes)
-4. [Quickstart](#quickstart)
-5. [Evaluation](#evaluation)
-6. [Chat transcript logging](#chat-transcript-logging)
-7. [Submission](#submission)
-8. [Judge interview](#judge-interview)
-
----
-
-## Repository layout
-
-```text
-.
-├── AGENTS.md                         # Rules for AI coding tools + transcript logging
-├── problem_statement.md              # Full task description and I/O schema
-├── README.md                         # You are here
-├── code/                             # Build your solution here
-│   ├── main.py                       # Suggested terminal entry point
-│   └── evaluation/
-│       └── main.py                   # Suggested evaluation entry point
-└── dataset/
-    ├── sample_claims.csv             # Inputs + expected outputs for development
-    ├── claims.csv                    # Inputs only; run your system on these rows
-    ├── user_history.csv              # Historical claim counts and risk context
-    ├── evidence_requirements.csv     # Minimum image evidence requirements
-    └── images/
-        ├── sample/                   # Images referenced by sample_claims.csv
-        └── test/                     # Images referenced by claims.csv
-```
-
----
-
-## What you need to build
-
-A system that, for each row in `dataset/claims.csv`, produces one row in `output.csv`.
-
-Input fields:
-
-| Column | Meaning |
-|---|---|
-| `user_id` | User submitting the claim; use this to look up `dataset/user_history.csv` |
-| `image_paths` | One or more submitted image paths, separated by semicolons |
-| `user_claim` | Chat transcript describing the issue |
-| `claim_object` | `car`, `laptop`, or `package` |
-
-Required output fields:
-
-| Column | Meaning |
-|---|---|
-| `evidence_standard_met` | Whether the image set is sufficient to evaluate the claim |
-| `evidence_standard_met_reason` | Short reason for the evidence decision |
-| `risk_flags` | Semicolon-separated risk flags, or `none` |
-| `issue_type` | Visible issue type |
-| `object_part` | Relevant object part |
-| `claim_status` | `supported`, `contradicted`, or `not_enough_information` |
-| `claim_status_justification` | Concise explanation grounded in the image evidence |
-| `supporting_image_ids` | Image IDs supporting the decision, or `none` |
-| `valid_image` | Whether the image set is usable for automated review |
-| `severity` | `none`, `low`, `medium`, `high`, or `unknown` |
-
-Hard requirements:
-
-- Must read the provided CSV files and local images.
-- Must produce `output.csv` with the exact schema in `problem_statement.md`.
-- Must include an evaluation workflow
-- Must avoid hardcoded test labels or file-specific answers.
-
-Beyond that you are free to bring your own approach: VLMs, LLMs, structured prompting, rule layers, batching, caching, evaluation pipelines, model comparison, or anything else.
-
----
-
-## Where your code goes
-
-All of your work belongs in [`code/`](./code/). The repo ships with empty starter files that you can grow into your full solution.
-
-Suggested conventions:
-
-- Put your main runnable solution in `code/main.py`, or document your own entry point clearly.
-- Put evaluation code under `code/evaluation/` or an `evaluation/` folder included in your final `code.zip`.
-- Write final predictions to `output.csv`.
-
----
-
-## Quickstart
-
-Clone this repository:
+### 1. Install dependencies
 
 ```bash
-git clone git@github.com:interviewstreet/hackerrank-orchestrate-june26.git
-cd hackerrank-orchestrate-june26
+pip install -r requirements.txt
 ```
 
-You are free to use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
+### 2. Set your API key
 
----
+Get a **free** API key from [Groq Console](https://console.groq.com/keys).
 
-## Evaluation
+```bash
+# Linux / macOS
+export GROQ_API_KEYS="key1,key2,key3"
 
-The evaluation report should include:
+# Windows PowerShell
+$env:GROQ_API_KEYS = "key1,key2,key3"
+```
+*(You can pass multiple comma-separated keys to enable automatic Key Rotation!)*
 
-- metrics on `dataset/sample_claims.csv`
-- at least two strategies, prompts, or model configurations compared
-- the final strategy used for `output.csv`
-- operational analysis covering model calls, token usage, image usage, approximate cost, runtime, and TPM/RPM considerations
+### 3. Run on the test set
 
----
+```bash
+python main.py
+```
 
-## Chat transcript logging
+This reads `dataset/claims.csv` and writes `output.csv` at the repo root.
 
-This repo ships with an `AGENTS.md` that modern AI coding tools may read. It instructs the tool to append conversation turns to a shared log file:
+### 4. Run on the sample set (for development)
 
-| Platform | Path |
-|---|---|
-| macOS / Linux | `$HOME/hackerrank_orchestrate/log.txt` |
-| Windows | `%USERPROFILE%\hackerrank_orchestrate\log.txt` |
+```bash
+python main.py --sample
+```
 
-You will upload this log as your chat transcript at submission time. The chat transcript means your conversation with the AI coding tool you used to build the system. It is not the runtime logs, reasoning trace, or conversation history produced by the claim-verification agent you are building.
+### 5. Evaluate
 
-If you use multiple AI tools, include the relevant conversation logs from all of them in the same transcript file. Separate each tool's section with a clear divider and label it with the tool name.
+```bash
+python evaluation/main.py
+```
 
-Never paste secrets into the chat. If secrets are needed, use environment variables.
+This processes `sample_claims.csv`, compares against expected outputs, and generates `evaluation/evaluation_report.md`.
 
----
+## Architecture
 
-## Submission
+```
+code/
+├── main.py              # Main pipeline (entry point)
+├── requirements.txt     # Python dependencies
+├── .env.example         # Environment variable template
+├── README.md            # This file
+└── evaluation/
+    ├── main.py           # Evaluation script
+    └── evaluation_report.md   # Generated after evaluation run
+```
 
-Submit the following files as instructed by HackerRank:
+### Pipeline design
 
-1. **Code zip**: zip your runnable solution, README, prompts/configs, and evaluation folder. Exclude virtualenvs, `node_modules`, build artifacts, and unnecessary generated files.
-2. **Predictions CSV**: your final `output.csv` for all rows in `dataset/claims.csv`.
-3. **Chat transcript**: the `log.txt` from the path in [Chat transcript logging](#chat-transcript-logging).
+```
+┌─────────────┐     ┌──────────────┐     ┌───────────────┐
+│ Load claim   │────▶│ Load images  │────▶│ Build prompt  │
+│ + user hist  │     │ (1-3 per     │     │ (claim +      │
+│ + ev. reqs   │     │  claim)      │     │  context)     │
+└─────────────┘     └──────────────┘     └──────┬────────┘
+                                                │
+                                                ▼
+                    ┌──────────────┐     ┌───────────────┐
+                    │ Validate &   │◀────│ Groq Llama 4  │
+                    │ normalise    │     │ VLM           │
+                    │ output       │     │ (JSON mode)   │
+                    └──────┬───────┘     └───────────────┘
+                           │
+                           ▼
+                    ┌──────────────┐
+                    │ Write CSV    │
+                    │ output row   │
+                    └──────────────┘
+```
 
-Before submitting, confirm:
+### Key design decisions
 
-- `output.csv` has one row per row in `dataset/claims.csv`.
-- `output.csv` has the exact required columns in the exact required order.
-- Your evaluation files are included in `code.zip`.
+**1. Prompt Engineering & Reasoning**
+- **One VLM call per claim** – all images sent together for holistic analysis
+- **Structured JSON output** – uses Groq's `response_format={"type": "json_object"}` for reliable parsing
+- **Chain-of-Thought (CoT)** – The model generates a `reasoning` field first, forcing it to analyze severity and image content before returning its final decision.
+- **Calibrated Risk & Severity** – Specific strict definitions for severity and risk flags were added to prevent model hallucinations and over-flagging.
 
----
+**2. Resilience & Reliability**
+- **Validation & Consistency Enforcement** – A strict validation layer normalizes all VLM outputs and enforces logical consistency (e.g. `valid_image = false` instantly triggers `claim_status = not_enough_information`).
+- **Model Fallback Chain** – Automatically rotates through working Groq Llama 4 models (Scout, Maverick) if one hits its rate limits.
+- **API Key Rotation** – If all models exhaust their free quota on one API key, the system automatically rotates to the next API key in `GROQ_API_KEYS`.
+- **Persistent Error Handling** – 5 retries with exponential backoff for 503 Server Unavailable errors, successfully exhausting failing models without crashing.
+- **Rate limiting** – 2.0s between requests (safe within 60 RPM free tier).
 
-## Judge interview
+## Configuration
 
-After submission, the AI Judge may ask about your approach, implementation decisions, model usage, evaluation strategy, and how you used AI while building the solution.
+| Env variable | Default | Description |
+|---|---|---|
+| `GROQ_API_KEYS` | *(required)* | Comma-separated list of Groq API keys |
+| `GROQ_MODEL` | `meta-llama/llama-4-scout-17b-16e-instruct` | Primary Groq model identifier |
 
-Be prepared to explain your solution in detail.
+## Cost
+
+**$0** – uses the Groq free tier with automatic model rotation to stay within quotas.
